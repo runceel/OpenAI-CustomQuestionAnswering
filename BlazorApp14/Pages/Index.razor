@@ -1,0 +1,136 @@
+﻿@page "/"
+@using Azure.AI.Language.QuestionAnswering;
+@using Azure;
+@using Azure.AI.OpenAI;
+@using System.Text;
+@using Microsoft.DeepDev;
+@inject IConfiguration Configuration
+
+<PageTitle>Index</PageTitle>
+
+<div>
+    <label>
+        質問:
+        <input type="text" @bind="_question" />
+    </label>
+    <button class="btn btn-primary" @onclick="OnSearchClick" disabled="@string.IsNullOrWhiteSpace(_question)">検索</button>
+    <button class="btn btn-primary" @onclick="OnCallOpenAIClick">結果を OpenAI でさらにいい感じに</button>
+</div>
+
+@if(!string.IsNullOrWhiteSpace(_openAIAnswer))
+{
+    <div class="alert alert-primary" role="alert">
+        <h3>OpenAI による要約回答</h3>
+        <span>@_openAIAnswer</span>
+    </div>
+}
+
+@if(_answers is not null)
+{
+    <h3>@_question に対する回答候補</h3>
+    <table class="table table-bordered">
+        <thead>
+            <tr>
+                <th>想定質問</th>
+                <th>回答</th>
+                <th>確かさ</th>
+                <th>ソース</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var answer in _answers)
+            {
+                <tr>
+                    <td>@answer.Questions.FirstOrDefault()</td>
+                    <td>@answer.Answer</td>
+                    <td>@answer.Confidence</td>
+                    <td>@answer.Source</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private QuestionAnsweringClient _questionAnsweringClient = default!;
+    private string _question = "";
+    private IEnumerable<KnowledgeBaseAnswer>? _answers;
+    private string? _openAIAnswer;
+
+    protected override void OnInitialized()
+    {
+        var cqa = Configuration.GetRequiredSection("CQA");
+        _questionAnsweringClient = new QuestionAnsweringClient(
+            cqa.GetValue<Uri>("Endpoint"),
+            new AzureKeyCredential(cqa.GetValue<string>("Key")!));
+    }
+
+    private async Task OnSearchClick()
+    {
+        if (string.IsNullOrWhiteSpace(_question)) return;
+
+        var cqa = Configuration.GetRequiredSection("CQA");
+        var answersResult = await _questionAnsweringClient.GetAnswersAsync(_question,
+            new QuestionAnsweringProject(cqa.GetValue<string>("ProjectName")!, cqa.GetValue<string>("DeploymentName")!),
+            new AnswersOptions
+            {
+                Size = 5,
+            });
+
+        _answers = answersResult.Value.Answers;
+    }
+
+    private async Task OnCallOpenAIClick()
+    {
+        var openAi = Configuration.GetRequiredSection("OpenAI");
+        var client = new OpenAIClient(
+            openAi.GetValue<Uri>("Endpoint"),
+            new AzureKeyCredential(openAi.GetValue<string>("Key")!)
+        );
+
+        var options = new ChatCompletionsOptions
+            {
+                // 回答に使うトークンの最大値は 1000 まで
+                MaxTokens = 1000,
+            };
+        // OpenAI に渡すプロンプトを生成
+        var messages = GenerateMessages();
+        foreach (var m in messages)
+        {
+            options.Messages.Add(m);
+        }
+
+        var answer = await client.GetChatCompletionsAsync(
+            openAi.GetValue<string>("DeploymentName")!, 
+            options);
+
+        if (answer is null) return;
+
+        _openAIAnswer = answer.Value.Choices[0].Message.Content;
+    }
+
+    private IEnumerable<ChatMessage> GenerateMessages()
+    {
+        if (_answers is null) throw new InvalidOperationException();
+
+        var tokenizer = TokenizerBuilder.CreateByModelName("gpt-3.5-turbo");
+        var systemMessage = new StringBuilder($"あなたは従業員の質問に答えるアシスタントです。従業員が「{_question}」と検索システムに尋ねたところ以下のような大量の質問が返ってきて困惑しています。" +
+            "検索結果は以下のようになっています。");
+        systemMessage.AppendLine("|タイトル|回答|スコア(0～1で1に近づくほど良い|");
+        systemMessage.AppendLine("|---|---|---|");
+
+        var tokenCount = tokenizer.Encode(systemMessage.ToString(), Array.Empty<string>()).Count;
+
+        foreach (var answer in _answers)
+        {
+            var line = $"|{answer.Questions.FirstOrDefault()}|{answer.Answer}|{answer.Confidence}|";
+            tokenCount += tokenizer.Encode(line, Array.Empty<string>()).Count;
+
+            if (tokenCount >= 6000) break;
+            systemMessage.AppendLine(line);
+        }
+
+        yield return new ChatMessage(ChatRole.System, systemMessage.ToString());
+        yield return new ChatMessage(ChatRole.User, "この回答の中から私の質問に関連する部分のみを抜き出して要約してください。");
+    }
+}
