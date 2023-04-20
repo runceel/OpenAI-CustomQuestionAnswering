@@ -8,26 +8,35 @@
 
 <PageTitle>Index</PageTitle>
 
-<div>
-    <label>
-        質問:
-        <input type="text" @bind="_question" />
-    </label>
-    <button class="btn btn-primary" @onclick="OnSearchClick" disabled="@string.IsNullOrWhiteSpace(_question)">検索</button>
-    <button class="btn btn-primary" @onclick="OnCallOpenAIClick">結果を OpenAI でさらにいい感じに</button>
+<div class="form-group">
+    <h3>Custom Question Answering に質問</h3>
+    <input type="text" @bind="_question" class="form-control" />
+    <button class="btn btn-primary" @onclick="OnSearchClick" disabled="@(string.IsNullOrWhiteSpace(_question) || _loadingCQA)">検索</button>
 </div>
 
-@if(!string.IsNullOrWhiteSpace(_openAIAnswer))
-{
-    <div class="alert alert-primary" role="alert">
-        <h3>OpenAI による要約回答</h3>
-        <span>@_openAIAnswer</span>
-    </div>
-}
 
-@if(_answers is not null)
+@if (_searchResultSnapshot is not null)
 {
-    <h3>@_question に対する回答候補</h3>
+    <h3>OpenAI へ追加質問</h3>
+    <div class="form-group">
+        <input type="text" @bind="_openAiPrompt" class="form-control" />
+        <button class="btn btn-primary" @onclick="OnCallOpenAIClick" disabled="@(string.IsNullOrWhiteSpace(_openAiPrompt) || _loadingOpenAI)">OpenAI に要約依頼</button>
+    </div>
+    @if (!string.IsNullOrWhiteSpace(_openAIAnswer))
+    {
+        <div class="alert alert-primary" role="alert">
+            <h3>OpenAI による要約回答</h3>
+            <span>@_openAIAnswer</span>
+        </div>
+    }
+    else
+    {
+        <div class="alert alert-primary" role="alert">
+            <span>OpenAI による要約中</span>
+        </div>
+    }
+
+    <h3>@_searchResultSnapshot.Question に対する回答候補</h3>
     <table class="table table-bordered">
         <thead>
             <tr>
@@ -38,7 +47,7 @@
             </tr>
         </thead>
         <tbody>
-            @foreach (var answer in _answers)
+            @foreach (var answer in _searchResultSnapshot.Answers)
             {
                 <tr>
                     <td>@answer.Questions.FirstOrDefault()</td>
@@ -53,65 +62,88 @@
 
 @code {
     private QuestionAnsweringClient _questionAnsweringClient = default!;
+    private OpenAIClient _openAIClient = default!;
+    private string _deploymentName = "";
     private string _question = "";
-    private IEnumerable<KnowledgeBaseAnswer>? _answers;
+    private string _openAiPrompt = "この回答の中から私の質問に関連する部分のみを抜き出して要約してください。";
+    private SearchResultSnapshot? _searchResultSnapshot;
     private string? _openAIAnswer;
+    private bool _loadingOpenAI;
+    private bool _loadingCQA;
 
     protected override void OnInitialized()
     {
         var cqa = Configuration.GetRequiredSection("CQA");
         _questionAnsweringClient = new QuestionAnsweringClient(
             cqa.GetValue<Uri>("Endpoint"),
-            new AzureKeyCredential(cqa.GetValue<string>("Key")!));
+            new AzureKeyCredential(cqa.GetValue<string>("Key") ?? throw new InvalidOperationException()));
+
+        var openAi = Configuration.GetRequiredSection("OpenAI");
+        _openAIClient = new OpenAIClient(
+            openAi.GetValue<Uri>("Endpoint"),
+            new AzureKeyCredential(openAi.GetValue<string>("Key") ?? throw new InvalidOperationException())
+        );
+        _deploymentName = openAi.GetValue<string>("DeploymentName") ?? throw new InvalidOperationException();
     }
 
     private async Task OnSearchClick()
     {
         if (string.IsNullOrWhiteSpace(_question)) return;
+        _loadingCQA = true;
+        using var _ = new LoadingContext(() => _loadingCQA = false);
+        _searchResultSnapshot = null;
 
         var cqa = Configuration.GetRequiredSection("CQA");
         var answersResult = await _questionAnsweringClient.GetAnswersAsync(_question,
             new QuestionAnsweringProject(cqa.GetValue<string>("ProjectName")!, cqa.GetValue<string>("DeploymentName")!),
             new AnswersOptions
-            {
-                Size = 5,
-            });
+                {
+                    Size = 5,
+                });
 
-        _answers = answersResult.Value.Answers;
+        _searchResultSnapshot = new(_question, answersResult.Value.Answers);
+
+        StateHasChanged();
+        await OnCallOpenAIClick();
     }
 
     private async Task OnCallOpenAIClick()
     {
-        var openAi = Configuration.GetRequiredSection("OpenAI");
-        var client = new OpenAIClient(
-            openAi.GetValue<Uri>("Endpoint"),
-            new AzureKeyCredential(openAi.GetValue<string>("Key")!)
-        );
-
-        var options = new ChatCompletionsOptions
-            {
-                // 回答に使うトークンの最大値は 1000 まで
-                MaxTokens = 1000,
-            };
-        // OpenAI に渡すプロンプトを生成
-        var messages = GenerateMessages();
-        foreach (var m in messages)
+        try
         {
-            options.Messages.Add(m);
+            _loadingOpenAI = true;
+            StateHasChanged();
+            using var _ = new LoadingContext(() => _loadingOpenAI = false);
+            _openAIAnswer = "";
+            var options = new ChatCompletionsOptions
+                {
+                    // 回答に使うトークンの最大値は 1000 まで
+                    MaxTokens = 1000,
+                };
+            // OpenAI に渡すプロンプトを生成
+            var messages = GenerateMessages();
+            foreach (var m in messages)
+            {
+                options.Messages.Add(m);
+            }
+
+            var answer = await _openAIClient.GetChatCompletionsAsync(
+                _deploymentName,
+                options);
+
+            if (answer is null) return;
+
+            _openAIAnswer = answer.Value.Choices[0].Message.Content;
         }
-
-        var answer = await client.GetChatCompletionsAsync(
-            openAi.GetValue<string>("DeploymentName")!, 
-            options);
-
-        if (answer is null) return;
-
-        _openAIAnswer = answer.Value.Choices[0].Message.Content;
+        catch (Exception ex)
+        {
+            _openAIAnswer = ex.ToString();
+        }
     }
 
     private IEnumerable<ChatMessage> GenerateMessages()
     {
-        if (_answers is null) throw new InvalidOperationException();
+        if (_searchResultSnapshot is null) throw new InvalidOperationException();
 
         var tokenizer = TokenizerBuilder.CreateByModelName("gpt-3.5-turbo");
         var systemMessage = new StringBuilder($"あなたは従業員の質問に答えるアシスタントです。従業員が「{_question}」と検索システムに尋ねたところ以下のような大量の質問が返ってきて困惑しています。" +
@@ -120,8 +152,9 @@
         systemMessage.AppendLine("|---|---|---|");
 
         var tokenCount = tokenizer.Encode(systemMessage.ToString(), Array.Empty<string>()).Count;
+        tokenCount += tokenizer.Encode(_openAiPrompt, Array.Empty<string>()).Count;
 
-        foreach (var answer in _answers)
+        foreach (var answer in _searchResultSnapshot.Answers)
         {
             var line = $"|{answer.Questions.FirstOrDefault()}|{answer.Answer}|{answer.Confidence}|";
             tokenCount += tokenizer.Encode(line, Array.Empty<string>()).Count;
@@ -131,6 +164,17 @@
         }
 
         yield return new ChatMessage(ChatRole.System, systemMessage.ToString());
-        yield return new ChatMessage(ChatRole.User, "この回答の中から私の質問に関連する部分のみを抜き出して要約してください。");
+        yield return new ChatMessage(ChatRole.User, _openAiPrompt);
+    }
+
+    record SearchResultSnapshot(string Question, IEnumerable<KnowledgeBaseAnswer> Answers);
+    class LoadingContext : IDisposable
+    {
+        private readonly Action _dispose;
+        public LoadingContext(Action dispose)
+        {
+            _dispose = dispose;
+        }
+        public void Dispose() => _dispose();
     }
 }
